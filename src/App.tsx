@@ -371,60 +371,25 @@ export default function App() {
   const multiFileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const folderDirectFileInputRef = useRef<HTMLInputElement | null>(null);
+  const refrescarDatosRef = useRef<((mostrarFeedback?: boolean) => Promise<void>) | null>(null);
   const [isDirectFolderUploading, setIsDirectFolderUploading] = useState<boolean>(false);
   const [uploadProgress, setUploadProgress] = useState<{ total: number; current: number; currentName: string } | null>(null);
 
-  // Estado de carpetas dinámicas y personalizadas (filtrando canciones de prueba y respetando orden personalizado)
+  // Estado de carpetas dinámicas.
+  // CRÍTICO: La app NO carga el orden desde localStorage para evitar desincronización entre dispositivos (PC vs celular).
+  // El orden se carga estricta y directamente desde Supabase ('user_preferences' o 'playlists').
   const [folders, setFolders] = useState<AudioFolder[]>(() => {
+    // Limpieza defensiva de claves locales obsoletas de orden para que no interfieran en navegadores móviles
     try {
-      const saved = localStorage.getItem('fa_folders_v3');
-      const savedOrder = localStorage.getItem('fa_folders_order_v1');
-      let baseList: AudioFolder[] = carpetasAudio;
-
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          baseList = parsed.map((f: AudioFolder) => ({
-            ...f,
-            canciones: (f.canciones || []).filter(
-              (c: Song) =>
-                !String(c.id).startsWith('demo_') &&
-                !String(c.id).startsWith('buch_') &&
-                !String(c.id).startsWith('fav_') &&
-                !String(c.id).startsWith('perr_') &&
-                !String(c.id).startsWith('lob_') &&
-                !String(c.id).startsWith('los_') &&
-                !String(c.id).startsWith('grwm_') &&
-                !String(c.id).startsWith('bal_') &&
-                !String(c.id).startsWith('reina_') &&
-                !String(c.id).startsWith('audio_') &&
-                !String(c.id).startsWith('mas_') &&
-                !String(c.id).startsWith('grup_') &&
-                !String(c.url).includes('soundhelix')
-            )
-          }));
+      localStorage.removeItem('fa_folders_order_v1');
+      localStorage.removeItem('spotyy_global_playlist_order');
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('spotyy_user_playlist_order_')) {
+          localStorage.removeItem(k);
         }
       }
-
-      // Aplicar orden guardado en localStorage si existe
-      if (savedOrder) {
-        try {
-          const orderIds: string[] = JSON.parse(savedOrder);
-          if (Array.isArray(orderIds) && orderIds.length > 0) {
-            const orderMap = new Map(orderIds.map((id, index) => [id, index]));
-            baseList.sort((a, b) => {
-              const idxA = orderMap.has(a.id) ? orderMap.get(a.id)! : 9999;
-              const idxB = orderMap.has(b.id) ? orderMap.get(b.id)! : 9999;
-              return idxA - idxB;
-            });
-          }
-        } catch {}
-      }
-
-      return baseList;
-    } catch (e) {
-      console.warn('Error cargando carpetas guardadas:', e);
-    }
+    } catch (_) {}
     return carpetasAudio;
   });
 
@@ -465,7 +430,6 @@ export default function App() {
         }))
       }));
       localStorage.setItem('fa_folders_v3', JSON.stringify(lightweight));
-      localStorage.setItem('fa_folders_order_v1', JSON.stringify(newFolders.map((f) => f.id)));
     } catch (e) {
       console.warn('Nota de cuota al guardar carpetas en localStorage (se mantiene en memoria de React):', e);
       try {
@@ -1246,6 +1210,7 @@ CREATE TABLE IF NOT EXISTS public.playlists (
   cover_key TEXT,
   badge TEXT,
   position INTEGER DEFAULT 0,
+  order_index INTEGER DEFAULT 0,
   "order" INTEGER DEFAULT 0,
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
@@ -1255,6 +1220,22 @@ ALTER TABLE public.playlists ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Permitir todo en playlists" ON public.playlists;
 CREATE POLICY "Permitir todo en playlists"
 ON public.playlists FOR ALL
+TO anon, authenticated
+USING (true)
+WITH CHECK (true);
+
+-- Tabla 'user_preferences' para orden personalizado de cada usuario
+CREATE TABLE IF NOT EXISTS public.user_preferences (
+  user_id UUID PRIMARY KEY,
+  playlist_order JSONB,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+ALTER TABLE public.user_preferences ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Permitir todo en user_preferences" ON public.user_preferences;
+CREATE POLICY "Permitir todo en user_preferences"
+ON public.user_preferences FOR ALL
 TO anon, authenticated
 USING (true)
 WITH CHECK (true);
@@ -1280,6 +1261,7 @@ WITH CHECK (true);
 ALTER PUBLICATION supabase_realtime ADD TABLE public.songs;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.folders;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.playlists;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.user_preferences;
 
 -- ========================================================
 -- 3. CONFIGURACIÓN DEL BUCKET 'musica' EN STORAGE
@@ -1672,11 +1654,27 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     };
     window.addEventListener('keydown', handleKeyDown);
 
+    // SINCRONIZACIÓN FORZADA AUTOMÁTICA: Refrescar datos desde Supabase al recuperar el foco o volver a la app
+    const handleFocusSync = () => {
+      refrescarDatosRef.current?.(false);
+    };
+
+    const handleVisibilitySync = () => {
+      if (document.visibilityState === 'visible') {
+        refrescarDatosRef.current?.(false);
+      }
+    };
+
+    window.addEventListener('focus', handleFocusSync);
+    document.addEventListener('visibilitychange', handleVisibilitySync);
+
     return () => {
       authListener.subscription.unsubscribe();
       supabase.removeChannel(channel);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('focus', handleFocusSync);
+      document.removeEventListener('visibilitychange', handleVisibilitySync);
     };
   }, []);
 
@@ -1840,9 +1838,11 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       }
 
       if (dbSongs) {
-        // Normalizar los datos garantizando las propiedades title, artist, cover_url, audio_url y folder_id
+        // Filtrar filas de configuración interna del sistema (__spotyy_) y normalizar las canciones
         const metaLocales = obtenerMetadatosLocales();
-        const cancionesBD: Song[] = dbSongs.map((row: any) => {
+        const cancionesBD: Song[] = dbSongs
+          .filter((row: any) => !String(row.title || '').startsWith('__spotyy_'))
+          .map((row: any) => {
           const cachedLyrics = obtenerLetraPersistente(row.id, row.audio_url, row.title, row.artist);
           const rawFolder = row.folder_id || row.folderId || metaLocales[row.audio_url]?.folderId || 'tus_me_gusta';
           return {
@@ -1939,31 +1939,40 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
   // ==========================================
   // CARGA Y SINCRONIZACIÓN DE CARPETAS Y PREFERENCIAS (SUPABASE)
-  // Regla 5: Carga carpetas globales de 'playlists' e INMEDIATAMENTE DESPUÉS
-  // busca si hay un registro en 'user_preferences' para ese user_id.
+  // Regla estricta: NO usar localStorage para el orden.
+  // 1. Cargar orden global desde 'playlists' (o 'folders').
+  // 2. Si el usuario tiene sesión, buscar preferencia en 'user_preferences' (playlist_order).
+  // 3. Aplicar orden personal si existe; de lo contrario mantener orden global de Supabase.
+  // 4. Guardar resultado directamente en el estado de React (setFolders).
   // ==========================================
   const cargarCarpetasDesdeSupabase = async (customUserId?: string, forzarSoloGlobal = false) => {
     try {
       let dbPlaylists: any[] | null = null;
 
-      // 1. CARGA INICIAL GLOBAL: Cargar desde la tabla principal 'playlists' (o 'folders') ordenada por order_index o position
-      const { data: pData, error: pErr } = await supabase
-        .from('playlists')
-        .select('*')
-        .order('order_index', { ascending: true });
-
-      if (!pErr && pData && pData.length > 0) {
-        dbPlaylists = pData;
-      } else {
-        const { data: pDataPos, error: pErrPos } = await supabase
+      // 1. Cargar desde la tabla principal 'playlists' ordenada por order_index o position si existe
+      try {
+        const { data: pData, error: pErr } = await supabase
           .from('playlists')
           .select('*')
-          .order('position', { ascending: true });
+          .order('order_index', { ascending: true });
 
-        if (!pErrPos && pDataPos && pDataPos.length > 0) {
-          dbPlaylists = pDataPos;
+        if (!pErr && pData && pData.length > 0) {
+          dbPlaylists = pData;
         } else {
-          // Fallback a 'folders'
+          const { data: pDataPos, error: pErrPos } = await supabase
+            .from('playlists')
+            .select('*')
+            .order('position', { ascending: true });
+
+          if (!pErrPos && pDataPos && pDataPos.length > 0) {
+            dbPlaylists = pDataPos;
+          }
+        }
+      } catch (_) {}
+
+      // Fallback a tabla 'folders'
+      if (!dbPlaylists || dbPlaylists.length === 0) {
+        try {
           const { data: fData, error: fErr } = await supabase
             .from('folders')
             .select('*')
@@ -1981,10 +1990,10 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
               dbPlaylists = fDataPos;
             }
           }
-        }
+        } catch (_) {}
       }
 
-      // Reconstruir lista en orden global
+      // Reconstruir lista en orden global sin mezclar orden de localStorage
       const prevFolders = foldersRef.current && foldersRef.current.length > 0 ? foldersRef.current : carpetasAudio;
       let listaOrdenada: AudioFolder[] = [];
 
@@ -2002,25 +2011,63 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
             canciones: existing?.canciones || []
           });
         }
-        for (const f of prevFolders) {
+        for (const f of carpetasAudio) {
           if (!dbIds.has(f.id)) {
-            listaOrdenada.push(f);
+            const existing = prevFolders.find((prev) => prev.id === f.id);
+            listaOrdenada.push(existing || f);
           }
         }
       } else {
-        listaOrdenada = [...prevFolders];
+        listaOrdenada = carpetasAudio.map((f) => {
+          const existing = prevFolders.find((prev) => prev.id === f.id);
+          return existing || f;
+        });
+
+        // Fallback en tabla 'songs' si 'playlists' o 'folders' aún no existen en el proyecto
+        try {
+          const { data: gData } = await supabase
+            .from('songs')
+            .select('audio_url')
+            .eq('title', '__spotyy_global_order__')
+            .maybeSingle();
+
+          if (gData?.audio_url) {
+            const rawG = JSON.parse(gData.audio_url);
+            if (Array.isArray(rawG) && rawG.length > 0) {
+              const map = new Map(listaOrdenada.map((f) => [f.id, f]));
+              const reordered: AudioFolder[] = [];
+              for (const id of rawG) {
+                const found = map.get(id);
+                if (found) {
+                  reordered.push(found);
+                  map.delete(id);
+                }
+              }
+              for (const rem of map.values()) {
+                reordered.push(rem);
+              }
+              listaOrdenada = reordered;
+            }
+          }
+        } catch (_) {}
       }
 
-      // 2. INMEDIATAMENTE DESPUÉS: Buscar preferencia personal en 'user_preferences' si el usuario ha iniciado sesión
-      const uid = customUserId || user?.id;
+      // 2. Buscar si hay un registro en 'user_preferences' estrictamente en Supabase (sin localStorage)
       let personalOrder: string[] | null = null;
+      let targetUid = customUserId || user?.id;
+      if (!targetUid) {
+        try {
+          const { data: userData } = await supabase.auth.getUser();
+          targetUid = userData?.user?.id;
+        } catch (_) {}
+      }
 
-      if (!forzarSoloGlobal && uid) {
+      if (!forzarSoloGlobal && targetUid) {
         try {
           const { data: prefData, error: prefErr } = await supabase
             .from('user_preferences')
             .select('playlist_order')
-            .eq('user_id', uid)
+            .eq('user_id', targetUid)
             .maybeSingle();
 
           if (!prefErr && prefData?.playlist_order) {
@@ -2037,18 +2084,26 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           console.warn('Nota al consultar user_preferences en Supabase:', prefCatch);
         }
 
-        // Respaldo en localStorage para el usuario actual
-        if (!personalOrder) {
+        // Fallback en 'songs' si 'user_preferences' aún no existe en Supabase
+        if (!personalOrder || personalOrder.length === 0) {
           try {
-            const localSaved = localStorage.getItem(`spotyy_user_playlist_order_${uid}`);
-            if (localSaved) {
-              personalOrder = JSON.parse(localSaved);
+            const { data: uData } = await supabase
+              .from('songs')
+              .select('audio_url')
+              .eq('title', `__spotyy_user_order__${targetUid}`)
+              .maybeSingle();
+
+            if (uData?.audio_url) {
+              const rawU = JSON.parse(uData.audio_url);
+              if (Array.isArray(rawU) && rawU.length > 0) {
+                personalOrder = rawU;
+              }
             }
           } catch (_) {}
         }
       }
 
-      // 3. Si existe preferencia personal, reordenar el arreglo basándote en el arreglo de IDs guardado en esa preferencia
+      // 3. Si existe preferencia personal en Supabase, reordenar las carpetas según esos IDs
       if (personalOrder && Array.isArray(personalOrder) && personalOrder.length > 0) {
         const map = new Map(listaOrdenada.map((f) => [f.id, f]));
         const listaPersonal: AudioFolder[] = [];
@@ -2065,17 +2120,38 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         listaOrdenada = listaPersonal;
       }
 
-      // 4. Actualizar estado y almacenamiento local
+      // 4. Actualizar el estado de React de inmediato
       setFolders(listaOrdenada);
       foldersRef.current = listaOrdenada;
-      try {
-        localStorage.setItem('fa_folders_v3', JSON.stringify(listaOrdenada));
-        localStorage.setItem('fa_folders_order_v1', JSON.stringify(listaOrdenada.map((f) => f.id)));
-      } catch (_) {}
     } catch (err) {
       console.warn('Nota al cargar carpetas desde Supabase:', err);
     }
   };
+
+  // ==========================================
+  // SINCRONIZACIÓN FORZADA (REFRESCAR DATOS DESDE SUPABASE)
+  // Vuelve a consultar canciones, carpetas y configuración directamente en Supabase
+  // ==========================================
+  const refrescarDatos = useCallback(async (mostrarFeedback = false) => {
+    try {
+      let uid = user?.id;
+      if (!uid) {
+        const { data: authData } = await supabase.auth.getUser();
+        uid = authData?.user?.id;
+      }
+      await Promise.all([
+        cargarCanciones(),
+        cargarCarpetasDesdeSupabase(uid),
+        cargarAppSettings()
+      ]);
+      if (mostrarFeedback) {
+        triggerToast('Datos y orden sincronizados desde Supabase', 'success');
+      }
+    } catch (err) {
+      console.warn('Error al sincronizar datos desde Supabase:', err);
+    }
+  }, [user]);
+  refrescarDatosRef.current = refrescarDatos;
 
   // ==========================================
   // AUTENTICACIÓN
@@ -3863,118 +3939,269 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     setOrdenModificado(true);
   };
 
-  // 2. Acción Deshacer: regresa al orden anterior y oculta la barra
+  // 2. Acción Deshacer: regresa al orden anterior y oculta la barra sin tocar Supabase ni localStorage
   const deshacerOrdenDesdeBarra = () => {
     if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
       setFolders(ordenPrevioCarpetas);
       foldersRef.current = ordenPrevioCarpetas;
-      try {
-        localStorage.setItem('fa_folders_v3', JSON.stringify(ordenPrevioCarpetas));
-        localStorage.setItem('fa_folders_order_v1', JSON.stringify(ordenPrevioCarpetas.map((f) => f.id)));
-      } catch {}
     }
     setOrdenModificado(false);
     setOrdenPrevioCarpetas(null);
     triggerToast('Cambios en el orden deshechos', 'info');
   };
 
-  // 3. Acción Guardar: hace la petición a Supabase y desaparece la barra
-  const guardarOrdenDesdeBarra = async () => {
+  // 3. Acción Guardar Personal (Todos los usuarios con sesión activa):
+  // Guarda en 'user_preferences' o con fallback en 'songs' si la tabla aún no existe.
+  const guardarOrdenPersonal = async () => {
     if (guardandoOrdenBarra) return;
     setGuardandoOrdenBarra(true);
 
     try {
-      const playlistOrder = folders.map((f) => f.id);
-
-      // Si el usuario es administrador, actualiza la tabla principal 'playlists' (y 'folders')
-      if (isAdmin) {
-        const playlistUpdates = folders.map((f, index) => ({
-          id: f.id,
-          titulo: f.titulo,
-          title: f.titulo,
-          subtitulo: f.subtitulo || '',
-          descripcion: f.descripcion || '',
-          cover_key: f.coverKey || '',
-          badge: f.badge || '',
-          order_index: index,
-          position: index,
-          order: index,
-          updated_at: new Date().toISOString()
-        }));
-
-        const { error: pErr } = await supabase
-          .from('playlists')
-          .upsert(playlistUpdates, { onConflict: 'id' });
-
-        if (pErr) {
-          console.warn('Nota en upsert playlists, intentando fila por fila:', pErr);
-          for (const item of playlistUpdates) {
-            await supabase.from('playlists').upsert(item, { onConflict: 'id' });
-          }
-        }
-
+      let activeUid = user?.id;
+      if (!activeUid) {
         try {
-          await supabase.from('folders').upsert(playlistUpdates, { onConflict: 'id' });
+          const { data: authData } = await supabase.auth.getUser();
+          activeUid = authData?.user?.id;
         } catch (_) {}
       }
 
-      // Si el usuario tiene sesión activa, guardar en la tabla 'user_preferences'
-      if (user?.id) {
+      if (!activeUid) {
+        alert('⚠️ Debes iniciar sesión con tu cuenta para guardar tu orden personal en Supabase.');
+        if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
+          setFolders(ordenPrevioCarpetas);
+          foldersRef.current = ordenPrevioCarpetas;
+        }
+        setOrdenModificado(false);
+        setOrdenPrevioCarpetas(null);
+        setGuardandoOrdenBarra(false);
+        return;
+      }
+
+      const playlistOrder = folders.map((f) => f.id);
+      let savedInSupabase = false;
+
+      // 1. Intentar en tabla 'user_preferences' si existe
+      try {
         const { error: prefErr } = await supabase
           .from('user_preferences')
           .upsert(
             {
-              user_id: user.id,
+              user_id: activeUid,
               playlist_order: playlistOrder,
               updated_at: new Date().toISOString()
             },
             { onConflict: 'user_id' }
           );
 
-        if (prefErr) {
-          console.warn('Nota en upsert user_preferences, intentando update:', prefErr);
+        if (!prefErr) {
+          savedInSupabase = true;
+        } else {
           const { error: updErr } = await supabase
             .from('user_preferences')
             .update({
               playlist_order: playlistOrder,
               updated_at: new Date().toISOString()
             })
-            .eq('user_id', user.id);
+            .eq('user_id', activeUid);
 
-          if (updErr) {
-            await supabase
-              .from('user_preferences')
-              .insert({
-                user_id: user.id,
-                playlist_order: playlistOrder,
-                updated_at: new Date().toISOString()
-              });
+          if (!updErr) {
+            savedInSupabase = true;
           }
-        }
-
-        try {
-          localStorage.setItem(`spotyy_user_playlist_order_${user.id}`, JSON.stringify(playlistOrder));
-        } catch (_) {}
-      }
-
-      // Actualizar localStorage
-      try {
-        localStorage.setItem('fa_folders_v3', JSON.stringify(folders));
-        localStorage.setItem('fa_folders_order_v1', JSON.stringify(playlistOrder));
-        if (isAdmin) {
-          localStorage.setItem('spotyy_global_playlist_order', JSON.stringify(playlistOrder));
         }
       } catch (_) {}
 
-      // Desaparece la barra al guardar con éxito
+      // 2. Fallback de máxima resiliencia en Supabase (tabla 'songs'):
+      // Si la tabla 'user_preferences' no ha sido creada aún en Supabase (PGRST205),
+      // persistir el orden personal en la tabla 'songs' existente en Supabase.
+      try {
+        const userOrderTitle = `__spotyy_user_order__${activeUid}`;
+        const { data: existingUserPref } = await supabase
+          .from('songs')
+          .select('id')
+          .eq('title', userOrderTitle)
+          .maybeSingle();
+
+        if (existingUserPref?.id) {
+          await supabase
+            .from('songs')
+            .update({
+              audio_url: JSON.stringify(playlistOrder),
+              artist: activeUid
+            })
+            .eq('id', existingUserPref.id);
+        } else {
+          await supabase
+            .from('songs')
+            .insert([{
+              title: userOrderTitle,
+              artist: activeUid,
+              audio_url: JSON.stringify(playlistOrder)
+            }]);
+        }
+        savedInSupabase = true;
+      } catch (uErr) {
+        console.warn('Nota guardando orden de usuario en songs:', uErr);
+      }
+
+      if (!savedInSupabase) {
+        throw new Error('No se pudo guardar en Supabase. Verifica tu conexión.');
+      }
+
+      // SOLO si Supabase responde con éxito:
+      // INMEDIATAMENTE DESPUÉS DE GUARDAR, actualizar el estado local de React
+      setFolders([...folders]);
+      foldersRef.current = [...folders];
       setOrdenModificado(false);
       setOrdenPrevioCarpetas(null);
-      triggerToast('¡Orden guardado en Supabase con éxito!', 'success');
+      triggerToast('Orden guardado en tu perfil. Lo verás cada vez que inicies sesión', 'success');
     } catch (err: any) {
-      console.error('Error al guardar orden en Supabase:', err);
-      triggerToast('Error al guardar en Supabase. El orden se mantiene en pantalla.', 'error');
+      console.error('Error al guardar orden personal en Supabase:', err);
+      // Si la petición a Supabase falla, muestra alert y NO cambies el orden en pantalla (revertir al previo)
+      alert(`⚠️ Error al guardar en Supabase: ${err?.message || 'Fallo de conexión'}. El orden no se guardó.`);
+      if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
+        setFolders(ordenPrevioCarpetas);
+        foldersRef.current = ordenPrevioCarpetas;
+      }
+      setOrdenModificado(false);
+      setOrdenPrevioCarpetas(null);
     } finally {
       setGuardandoOrdenBarra(false);
+    }
+  };
+
+  // 4. Acción Guardar Global (Solo Administrador):
+  // Actualiza la posición de las carpetas en Supabase (playlists / folders / songs).
+  const guardarOrdenGlobal = async () => {
+    if (guardandoOrdenBarra) return;
+    if (!isAdmin) {
+      alert('⚠️ Solo el administrador puede guardar el orden global.');
+      return;
+    }
+    setGuardandoOrdenBarra(true);
+
+    try {
+      const playlistOrder = folders.map((f) => f.id);
+      const playlistUpdates = folders.map((f, index) => ({
+        id: f.id,
+        titulo: f.titulo,
+        title: f.titulo,
+        subtitulo: f.subtitulo || '',
+        descripcion: f.descripcion || '',
+        cover_key: f.coverKey || '',
+        badge: f.badge || '',
+        order_index: index,
+        position: index,
+        order: index,
+        updated_at: new Date().toISOString()
+      }));
+
+      let savedGlobally = false;
+
+      // 1. Intentar actualizar tabla dedicada 'playlists' si existe
+      try {
+        const { error: pErr } = await supabase
+          .from('playlists')
+          .upsert(playlistUpdates, { onConflict: 'id' });
+        if (!pErr) {
+          savedGlobally = true;
+        }
+      } catch (_) {}
+
+      // 2. Intentar actualizar tabla dedicada 'folders' si existe
+      try {
+        const { error: fErr } = await supabase
+          .from('folders')
+          .upsert(playlistUpdates, { onConflict: 'id' });
+        if (!fErr) {
+          savedGlobally = true;
+        }
+      } catch (_) {}
+
+      // 3. Fallback de máxima resiliencia en Supabase (tabla 'songs'):
+      // Si 'playlists' o 'folders' aún no existen en el proyecto de Supabase (PGRST205),
+      // persistir el orden global de forma permanente en la tabla 'songs' existente en Supabase.
+      try {
+        const { data: existingConfig } = await supabase
+          .from('songs')
+          .select('id')
+          .eq('title', '__spotyy_global_order__')
+          .maybeSingle();
+
+        if (existingConfig?.id) {
+          await supabase
+            .from('songs')
+            .update({
+              audio_url: JSON.stringify(playlistOrder),
+              artist: '__config__'
+            })
+            .eq('id', existingConfig.id);
+        } else {
+          await supabase
+            .from('songs')
+            .insert([{
+              title: '__spotyy_global_order__',
+              artist: '__config__',
+              audio_url: JSON.stringify(playlistOrder)
+            }]);
+        }
+        savedGlobally = true;
+      } catch (sErr) {
+        console.warn('Nota guardando orden global en songs:', sErr);
+      }
+
+      if (!savedGlobally) {
+        throw new Error('No se pudo guardar en Supabase. Verifica tu conexión.');
+      }
+
+      // SOLO si Supabase responde con éxito:
+      setFolders([...folders]);
+      foldersRef.current = [...folders];
+      setOrdenModificado(false);
+      setOrdenPrevioCarpetas(null);
+      triggerToast('Orden global actualizado para toda la aplicación', 'success');
+    } catch (err: any) {
+      console.error('Error al guardar orden global en Supabase:', err);
+      alert(`⚠️ Error al guardar orden global en Supabase: ${err?.message || 'Fallo de conexión'}. El orden no se guardó.`);
+      if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
+        setFolders(ordenPrevioCarpetas);
+        foldersRef.current = ordenPrevioCarpetas;
+      }
+      setOrdenModificado(false);
+      setOrdenPrevioCarpetas(null);
+    } finally {
+      setGuardandoOrdenBarra(false);
+    }
+  };
+
+  // 5. Acción Restablecer Orden: Elimina preferencia del usuario en Supabase y vuelve al orden global
+  const restablecerOrden = async () => {
+    try {
+      let activeUid = user?.id;
+      if (!activeUid) {
+        const { data: authData } = await supabase.auth.getUser();
+        activeUid = authData?.user?.id;
+      }
+      if (activeUid) {
+        try {
+          await supabase.from('user_preferences').delete().eq('user_id', activeUid);
+        } catch (_) {}
+        try {
+          await supabase.from('songs').delete().eq('title', `__spotyy_user_order__${activeUid}`);
+        } catch (_) {}
+      }
+      await cargarCarpetasDesdeSupabase(undefined, true);
+      triggerToast('Orden personal restablecido al global', 'success');
+    } catch (err: any) {
+      alert(`⚠️ Error al restablecer orden: ${err?.message || 'Error de conexión'}`);
+    }
+  };
+
+  // 6. Router Guardar desde la barra flotante
+  const guardarOrdenDesdeBarra = async (tipo: 'personal' | 'global' = 'personal') => {
+    if (tipo === 'global' && isAdmin) {
+      await guardarOrdenGlobal();
+    } else {
+      await guardarOrdenPersonal();
     }
   };
 
@@ -6571,10 +6798,20 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           </button>
         )}
 
+        {/* Botón Sincronización Forzada desde Supabase */}
+        <button
+          onClick={() => refrescarDatos(true)}
+          className="ml-auto px-2.5 py-1 rounded-full text-[11px] font-bold bg-white/5 hover:bg-white/15 text-emerald-400 hover:text-white border border-emerald-500/30 flex items-center gap-1 shrink-0 transition active:scale-95 shadow-sm cursor-pointer"
+          title="Actualizar y sincronizar canciones y orden directamente desde Supabase"
+        >
+          <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
+          <span>Actualizar</span>
+        </button>
+
         {/* Botón rápido Instalar PWA en Celular */}
         <button
           onClick={handleInstallPWA}
-          className="ml-auto px-2.5 py-1 rounded-full text-[11px] font-bold bg-[#1ED760]/10 hover:bg-[#1ED760]/20 text-[#1ED760] border border-[#1ED760]/40 flex items-center gap-1 shrink-0 transition shadow-sm active:scale-95"
+          className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-[#1ED760]/10 hover:bg-[#1ED760]/20 text-[#1ED760] border border-[#1ED760]/40 flex items-center gap-1 shrink-0 transition shadow-sm active:scale-95"
           title="Instalar en celular Android con su propio icono"
         >
           <Smartphone className="w-3.5 h-3.5 text-[#1ED760]" />
@@ -10925,30 +11162,60 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           BARRA FLOTANTE / TOAST INFERIOR: ORDEN MODIFICADO [GUARDAR] [DESHACER]
           ========================================== */}
       {ordenModificado && (
-        <div className="fixed bottom-24 sm:bottom-28 left-1/2 -translate-x-1/2 z-50 bg-[#1C1C1E]/95 backdrop-blur-md border border-emerald-500/50 text-white px-4 py-2.5 rounded-full shadow-2xl flex items-center gap-3.5 animate-fade-in text-xs sm:text-sm font-semibold max-w-[94vw]">
-          <div className="flex items-center gap-2 text-gray-200 shrink-0">
+        <div className="fixed bottom-24 sm:bottom-28 left-1/2 -translate-x-1/2 z-50 bg-[#1C1C1E]/95 backdrop-blur-md border border-emerald-500/50 text-white px-3.5 sm:px-4 py-2.5 rounded-full shadow-2xl flex items-center gap-2 sm:gap-3.5 animate-fade-in text-xs sm:text-sm font-semibold max-w-[95vw]">
+          <div className="flex items-center gap-1.5 sm:gap-2 text-gray-200 shrink-0">
             <Sparkles className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span className="font-bold">Orden modificado</span>
+            <span className="font-bold whitespace-nowrap">Orden modificado</span>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              onClick={guardarOrdenDesdeBarra}
-              disabled={guardandoOrdenBarra}
-              className="px-3.5 py-1.5 rounded-full bg-[#1ED760] hover:bg-[#1db954] text-black font-extrabold text-xs shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
-            >
-              {guardandoOrdenBarra ? (
-                <>
-                  <RefreshCw className="w-3 h-3 animate-spin" />
-                  <span>Guardando...</span>
-                </>
-              ) : (
-                <span>Guardar</span>
-              )}
-            </button>
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {isAdmin ? (
+              <>
+                <button
+                  onClick={() => guardarOrdenDesdeBarra('global')}
+                  disabled={guardandoOrdenBarra}
+                  className="px-3 py-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white font-extrabold text-xs shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50 flex items-center gap-1 whitespace-nowrap"
+                  title="Guardar orden global en Supabase para todos los usuarios"
+                >
+                  {guardandoOrdenBarra ? (
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <span>🌍 Guardar Global</span>
+                  )}
+                </button>
+                <button
+                  onClick={() => guardarOrdenDesdeBarra('personal')}
+                  disabled={guardandoOrdenBarra}
+                  className="px-3 py-1.5 rounded-full bg-[#1ED760] hover:bg-[#1db954] text-black font-extrabold text-xs shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50 flex items-center gap-1 whitespace-nowrap"
+                  title="Guardar orden personal en tu perfil de Supabase"
+                >
+                  {guardandoOrdenBarra ? (
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <span>👤 Guardar Personal</span>
+                  )}
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => guardarOrdenDesdeBarra('personal')}
+                disabled={guardandoOrdenBarra}
+                className="px-3.5 py-1.5 rounded-full bg-[#1ED760] hover:bg-[#1db954] text-black font-extrabold text-xs shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50 flex items-center gap-1.5 whitespace-nowrap"
+                title="Guardar orden en Supabase"
+              >
+                {guardandoOrdenBarra ? (
+                  <>
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    <span>Guardando...</span>
+                  </>
+                ) : (
+                  <span>Guardar</span>
+                )}
+              </button>
+            )}
             <button
               onClick={deshacerOrdenDesdeBarra}
               disabled={guardandoOrdenBarra}
-              className="px-3.5 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-gray-200 hover:text-white font-bold text-xs border border-white/15 transition active:scale-95 cursor-pointer disabled:opacity-50"
+              className="px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-gray-200 hover:text-white font-bold text-xs border border-white/15 transition active:scale-95 cursor-pointer disabled:opacity-50 whitespace-nowrap"
             >
               Deshacer
             </button>
